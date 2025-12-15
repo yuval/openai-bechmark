@@ -16,6 +16,7 @@ import os
 import random
 import time
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any
 
@@ -273,90 +274,88 @@ async def run_stress_test(
     total_attempts = 0
     success_latencies: list[float] = []
     success_total_durations: list[float] = []
-    out_fh = open(out_path, "w", encoding="utf-8") if out_path else None
-
     start_wall = time.time()
 
     lock = asyncio.Lock()  # keep writes / shared counters consistent
 
-    async def worker(worker_id: int, session: aiohttp.ClientSession) -> None:
-        nonlocal completed, succeeded, total_attempts
+    with (open(out_path, "w", encoding="utf-8") if out_path else nullcontext()) as out_fh:
 
-        while True:
-            try:
-                request_index = queue.get_nowait()
-            except asyncio.QueueEmpty:
-                return
+        async def worker(worker_id: int, session: aiohttp.ClientSession) -> None:
+            nonlocal completed, succeeded, total_attempts
 
-            result = await run_one_request(
-                session=session,
-                headers=headers,
-                template=template,
-                request_index=request_index,
-                timeout_s=timeout_s,
-                retries=retries,
-                retry_delay_s=retry_delay_s,
-            )
-            logging.debug(f"Request {request_index} completed in {result.total_duration_ms:.0f}ms (latency={result.latency_ms or 0:.0f}ms, ok={result.ok})")
+            while True:
+                try:
+                    request_index = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
 
-            async with lock:
-                completed += 1
-                total_attempts += result.attempts
-                if result.ok:
-                    succeeded += 1
-                    if result.latency_ms is not None:
-                        success_latencies.append(result.latency_ms)
-                    success_total_durations.append(result.total_duration_ms)
+                result = await run_one_request(
+                    session=session,
+                    headers=headers,
+                    template=template,
+                    request_index=request_index,
+                    timeout_s=timeout_s,
+                    retries=retries,
+                    retry_delay_s=retry_delay_s,
+                )
+                logging.debug(f"Request {request_index} completed in {result.total_duration_ms:.0f}ms (latency={result.latency_ms or 0:.0f}ms, ok={result.ok})")
 
-                if out_fh:
-                    row = {
-                        "request_index": request_index,
-                        "ok": result.ok,
-                        "attempts": result.attempts,
-                        "latency_ms": result.latency_ms,
-                        "total_duration_ms": result.total_duration_ms,
-                        "status": result.status,
-                        "response_id": result.response_id,
-                    }
-                    if not result.ok:
-                        row["error"] = result.error
-                    out_fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+                async with lock:
+                    completed += 1
+                    total_attempts += result.attempts
+                    if result.ok:
+                        succeeded += 1
+                        if result.latency_ms is not None:
+                            success_latencies.append(result.latency_ms)
+                        success_total_durations.append(result.total_duration_ms)
 
-                if progress_every > 0 and completed % progress_every == 0:
-                    elapsed = time.time() - start_wall
-                    job_rps = completed / elapsed if elapsed > 0 else 0.0
-                    api_rps = total_attempts / elapsed if elapsed > 0 else 0.0
-                    logging.info(
-                        f"Progress: {completed}/{num_requests} done | "
-                        f"ok={succeeded} | job_rps={job_rps:.2f} | api_rps={api_rps:.2f}"
-                    )
+                    if out_fh:
+                        row = {
+                            "request_index": request_index,
+                            "ok": result.ok,
+                            "attempts": result.attempts,
+                            "latency_ms": result.latency_ms,
+                            "total_duration_ms": result.total_duration_ms,
+                            "status": result.status,
+                            "response_id": result.response_id,
+                        }
+                        if not result.ok:
+                            row["error"] = result.error
+                        out_fh.write(json.dumps(row, ensure_ascii=False) + "\n")
 
-    def ramp_delay_for_worker(worker_id: int) -> float:
-        if ramp_up_s <= 0 or concurrency <= 1:
-            return 0.0
-        step = ramp_up_s / max(concurrency - 1, 1)
-        return worker_id * step
+                    if progress_every > 0 and completed % progress_every == 0:
+                        elapsed = time.time() - start_wall
+                        job_rps = completed / elapsed if elapsed > 0 else 0.0
+                        api_rps = total_attempts / elapsed if elapsed > 0 else 0.0
+                        logging.info(
+                            f"Progress: {completed}/{num_requests} done | "
+                            f"ok={succeeded} | job_rps={job_rps:.2f} | api_rps={api_rps:.2f}"
+                        )
 
-    logging.info(f"Starting stress test with {concurrency} workers, {num_requests} requests")
-    async with aiohttp.ClientSession(connector=connector) as session:
-        tasks: list[asyncio.Task[None]] = []
-        for wid in range(concurrency):
-            delay = ramp_delay_for_worker(wid)
-            if delay > 0:
-                # Stagger worker start to avoid burst at t=0
-                async def delayed_start(w: int, d: float, s: aiohttp.ClientSession) -> None:
-                    await asyncio.sleep(d)
-                    await worker(w, s)
+        def ramp_delay_for_worker(worker_id: int) -> float:
+            if ramp_up_s <= 0 or concurrency <= 1:
+                return 0.0
+            step = ramp_up_s / max(concurrency - 1, 1)
+            return worker_id * step
 
-                tasks.append(asyncio.create_task(delayed_start(wid, delay, session)))
-            else:
-                tasks.append(asyncio.create_task(worker(wid, session)))
+        logging.info(f"Starting stress test with {concurrency} workers, {num_requests} requests")
+        async with aiohttp.ClientSession(connector=connector) as session:
+            tasks: list[asyncio.Task[None]] = []
+            for wid in range(concurrency):
+                delay = ramp_delay_for_worker(wid)
+                if delay > 0:
+                    # Stagger worker start to avoid burst at t=0
+                    async def delayed_start(w: int, d: float, s: aiohttp.ClientSession) -> None:
+                        await asyncio.sleep(d)
+                        await worker(w, s)
 
-        await asyncio.gather(*tasks)
+                    tasks.append(asyncio.create_task(delayed_start(wid, delay, session)))
+                else:
+                    tasks.append(asyncio.create_task(worker(wid, session)))
+
+            await asyncio.gather(*tasks)
 
     elapsed = time.time() - start_wall
-    if out_fh:
-        out_fh.close()
 
     # Summary
     failed = completed - succeeded
